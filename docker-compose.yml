@@ -1,0 +1,198 @@
+name: mlops-hw3
+
+x-app: &app
+  image: mlops-hw3-app:local
+  build: .
+  environment: &app-env
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: fraud_db
+    POSTGRES_USER: fraud_user
+    POSTGRES_PASSWORD: fraud_password
+    SHARED_DIR: /shared
+    BATCH_ROWS: ${BATCH_ROWS:-5000}
+  networks: [ml-scorer]
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    restart: unless-stopped
+    networks: [ml-scorer]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    restart: unless-stopped
+    depends_on: [zookeeper]
+    networks: [ml-scorer]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: [CMD, kafka-topics, --bootstrap-server, localhost:9092, --list]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    networks: [ml-scorer]
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        for topic in transactions scores; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$topic" --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        done
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    networks: [ml-scorer]
+    environment:
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+      POSTGRES_DB: fraud_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U fraud_user -d fraud_db]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  data_loader:
+    <<: *app
+    command: [python, -m, data_loader.app]
+    volumes:
+      - ./data:/data:ro
+      - shared:/shared
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  fraud_detector:
+    <<: *app
+    restart: unless-stopped
+    volumes: [shared:/shared:ro]
+    depends_on:
+      data_loader: {condition: service_completed_successfully}
+      kafka-setup: {condition: service_completed_successfully}
+
+  scoring_writer:
+    build: ./scoring_writer
+    restart: unless-stopped
+    networks: [ml-scorer]
+    environment: *app-env
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka-setup: {condition: service_completed_successfully}
+
+  transaction_simulator:
+    <<: *app
+    restart: unless-stopped
+    command: [python, producer/producer.py, --repeat, --limit, "2000", --interval, "${SEND_INTERVAL_SECONDS:-1}"]
+    volumes: [./data:/data:ro]
+    depends_on:
+      data_loader: {condition: service_completed_successfully}
+      kafka-setup: {condition: service_completed_successfully}
+
+  producer:
+    <<: *app
+    profiles: [send]
+    command: [--limit, "20"]
+    entrypoint: [python, producer/producer.py]
+    volumes: [./data:/data:ro]
+    depends_on:
+      kafka-setup: {condition: service_completed_successfully}
+
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    restart: unless-stopped
+    networks: [ml-scorer]
+    environment:
+      <<: *app-env
+      PYTHONPATH: /opt/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__PARALLELISM: "2"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://fraud_user:fraud_password@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: hw3-local-demo-secret
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "20"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    command: [bash, /opt/airflow/start.sh]
+    volumes:
+      - shared:/shared
+      - airflow_logs:/opt/airflow/logs
+    ports: [127.0.0.1:8081:8080]
+    depends_on:
+      data_loader: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://localhost:8080/health | python -c 'import json,sys; h=json.load(sys.stdin); sys.exit(h[\"scheduler\"][\"status\"] != \"healthy\")'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    networks: [ml-scorer]
+    ports: [127.0.0.1:8080:8080]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka-setup: {condition: service_completed_successfully}
+
+  interface:
+    build: ./interface
+    restart: unless-stopped
+    networks: [ml-scorer]
+    environment: *app-env
+    ports: [127.0.0.1:8501:8501]
+    depends_on:
+      data_loader: {condition: service_completed_successfully}
+      kafka-setup: {condition: service_completed_successfully}
+
+  reports:
+    image: mlops-hw3-app:local
+    restart: unless-stopped
+    networks: [ml-scorer]
+    command: [python, -m, http.server, "8000", --directory, /shared/reports]
+    volumes: [shared:/shared:ro]
+    ports: [127.0.0.1:8082:8000]
+    depends_on:
+      data_loader: {condition: service_completed_successfully}
+
+networks:
+  ml-scorer:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  shared:
+  airflow_logs:
